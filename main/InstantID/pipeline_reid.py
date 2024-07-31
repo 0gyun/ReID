@@ -133,7 +133,10 @@ def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,2
     out_img_pil = PIL.Image.fromarray(out_img.astype(np.uint8))
     return out_img_pil
     
-class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
+class StableDiffusionXLInstantIDPipeline(
+    StableDiffusionXLControlNetPipeline
+):
+
     
     def cuda(self, dtype=torch.float16, use_xformers=False): # cuda 설정
         self.to('cuda', dtype)
@@ -247,7 +250,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         self,
         prompt: Union[str, List[str]] = None,
         prompt_2: Optional[Union[str, List[str]]] = None,
-        image: PipelineImageInput = None,
+        ctrl_image: PipelineImageInput = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -262,7 +265,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
-        image_embeds: Optional[torch.FloatTensor] = None,
+        ctrl_image_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -283,6 +286,22 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         # IP adapter
         ip_adapter_scale=None,
 
+        # Inpainting
+        init_image: PipelineImageInput = None,
+        mask_image: PipelineImageInput = None,
+        masked_image_latents: torch.Tensor = None,
+        padding_mask_crop: Optional[int] = None,
+        timesteps: List[int] = None,
+        sigmas: List[float] = None,
+        denoising_start: Optional[float] = None,
+        denoising_end: Optional[float] = None,
+        ip_adapter_image: Optional[PipelineImageInput] = None,
+        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        guidance_rescale: float = 0.0,
+        aesthetic_score: float = 6.0,
+        negative_aesthetic_score: float = 2.5,
+        strength: float = 0.3,
+
         **kwargs,
     ):
         r"""
@@ -294,7 +313,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             prompt_2 (`str` or `List[str]`, *optional*):
                 The prompt or prompts to be sent to `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
                 used in both text-encoders.
-            image (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
+            ctrl_image (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
                     `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
                 The ControlNet input condition to provide guidance to the `unet` for generation. If the type is
                 specified as `torch.FloatTensor`, it is passed to ControlNet as is. `PIL.Image.Image` can also be
@@ -347,7 +366,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 Pre-generated negative pooled text embeddings. Can be used to easily tweak text inputs (prompt
                 weighting). If not provided, pooled `negative_prompt_embeds` are generated from `negative_prompt` input
                 argument.
-            image_embeds (`torch.FloatTensor`, *optional*):
+            ctrl_image_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated image embeddings.
             output_type (`str`, *optional*, defaults to `"pil"`):
                 The output format of the generated image. Choose between `PIL.Image` or `np.array`.
@@ -410,6 +429,68 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeine class.
 
+            image (`PIL.Image.Image`):
+                `Image`, or tensor representing an image batch which will be inpainted, *i.e.* parts of the image will
+                be masked out with `mask_image` and repainted according to `prompt`.
+            mask_image (`PIL.Image.Image`):
+                `Image`, or tensor representing an image batch, to mask `image`. White pixels in the mask will be
+                repainted, while black pixels will be preserved. If `mask_image` is a PIL image, it will be converted
+                to a single channel (luminance) before use. If it's a tensor, it should contain one color channel (L)
+                instead of 3, so the expected shape would be `(B, H, W, 1)`.
+            padding_mask_crop (`int`, *optional*, defaults to `None`):
+                The size of margin in the crop to be applied to the image and masking. If `None`, no crop is applied to
+                image and mask_image. If `padding_mask_crop` is not `None`, it will first find a rectangular region
+                with the same aspect ration of the image and contains all masked area, and then expand that area based
+                on `padding_mask_crop`. The image and mask_image will then be cropped based on the expanded area before
+                resizing to the original image size for inpainting. This is useful when the masked area is small while
+                the image is large and contain information irrelevant for inpainting, such as background.
+            strength (`float`, *optional*, defaults to 0.9999):
+                Conceptually, indicates how much to transform the masked portion of the reference `image`. Must be
+                between 0 and 1. `image` will be used as a starting point, adding more noise to it the larger the
+                `strength`. The number of denoising steps depends on the amount of noise initially added. When
+                `strength` is 1, added noise will be maximum and the denoising process will run for the full number of
+                iterations specified in `num_inference_steps`. A value of 1, therefore, essentially ignores the masked
+                portion of the reference `image`. Note that in the case of `denoising_start` being declared as an
+                integer, the value of `strength` will be ignored.
+            timesteps (`List[int]`, *optional*):
+                Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
+                in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
+                passed will be used. Must be in descending order.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
+                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
+                will be used.
+            denoising_start (`float`, *optional*):
+                When specified, indicates the fraction (between 0.0 and 1.0) of the total denoising process to be
+                bypassed before it is initiated. Consequently, the initial part of the denoising process is skipped and
+                it is assumed that the passed `image` is a partly denoised image. Note that when this is specified,
+                strength will be ignored. The `denoising_start` parameter is particularly beneficial when this pipeline
+                is integrated into a "Mixture of Denoisers" multi-pipeline setup, as detailed in [**Refining the Image
+                Output**](https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/stable_diffusion_xl#refining-the-image-output).
+            denoising_end (`float`, *optional*):
+                When specified, determines the fraction (between 0.0 and 1.0) of the total denoising process to be
+                completed before it is intentionally prematurely terminated. As a result, the returned sample will
+                still retain a substantial amount of noise (ca. final 20% of timesteps still needed) and should be
+                denoised by a successor pipeline that has `denoising_start` set to 0.8 so that it only denoises the
+                final 20% of the scheduler. The denoising_end parameter should ideally be utilized when this pipeline
+                forms a part of a "Mixture of Denoisers" multi-pipeline setup, as elaborated in [**Refining the Image
+                Output**](https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/stable_diffusion_xl#refining-the-image-output).
+            ip_adapter_image: (`PipelineImageInput`, *optional*): Optional image input to work with IP Adapters.
+            ip_adapter_image_embeds (`List[torch.Tensor]`, *optional*):
+                Pre-generated image embeddings for IP-Adapter. It should be a list of length same as number of
+                IP-adapters. Each element should be a tensor of shape `(batch_size, num_images, emb_dim)`. It should
+                contain the negative image embedding if `do_classifier_free_guidance` is set to `True`. If not
+                provided, embeddings are computed from the `ip_adapter_image` input argument.
+            aesthetic_score (`float`, *optional*, defaults to 6.0):
+                Used to simulate an aesthetic score of the generated image by influencing the positive text condition.
+                Part of SDXL's micro-conditioning as explained in section 2.2 of
+                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952).
+            negative_aesthetic_score (`float`, *optional*, defaults to 2.5):
+                Part of SDXL's micro-conditioning as explained in section 2.2 of
+                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). Can be used to
+                simulate an aesthetic score of the generated image by influencing the negative text condition.
+
+                
         Examples:
 
         Returns:
@@ -449,7 +530,11 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 mult * [control_guidance_start],
                 mult * [control_guidance_end],
             )
-        
+
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
         # 0. set ip_adapter_scale (ip adapter의 scale 설정)
         if ip_adapter_scale is not None:
             self.set_ip_adapter_scale(ip_adapter_scale)
@@ -458,7 +543,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         self.check_inputs(
             prompt=prompt,
             prompt_2=prompt_2,
-            image=image,
+            image=ctrl_image,
             callback_steps=callback_steps,
             negative_prompt=negative_prompt,
             negative_prompt_2=negative_prompt_2,
@@ -522,8 +607,8 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             clip_skip=self.clip_skip,
         )
         
-        # 3.2 Encode image prompt
-        prompt_image_emb = self._encode_prompt_image_emb(image_embeds, 
+        # 3.2 Encode image prompt (Image는 ControlNet의 condition으로 들어갈 keypoints / image embed 안쓸 예정)
+        prompt_image_emb = self._encode_prompt_image_emb(ctrl_image_embeds, 
                                                          device,
                                                          num_images_per_prompt,
                                                          self.unet.dtype,
@@ -531,8 +616,8 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         
         # 4. Prepare image (ControlNetModel을 위한 image 전처리. 여기서 Image는 ControlNet에 condition으로 들어갈 keypoint image)
         if isinstance(controlnet, ControlNetModel):
-            image = self.prepare_image(
-                image=image,
+            ctrl_image = self.prepare_image(
+                image=ctrl_image,
                 width=width,
                 height=height,
                 batch_size=batch_size * num_images_per_prompt,
@@ -542,13 +627,13 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
                 guess_mode=guess_mode,
             )
-            height, width = image.shape[-2:]
+            height, width = ctrl_image.shape[-2:]
         elif isinstance(controlnet, MultiControlNetModel):
-            images = []
+            ctrl_images = []
 
-            for image_ in image:
-                image_ = self.prepare_image(
-                    image=image_,
+            for ctrl_image_ in ctrl_image:
+                ctrl_image_ = self.prepare_image(
+                    image=ctrl_image_,
                     width=width,
                     height=height,
                     batch_size=batch_size * num_images_per_prompt,
@@ -559,10 +644,10 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                     guess_mode=guess_mode,
                 )
 
-                images.append(image_)
+                ctrl_images.append(ctrl_image_)
 
-            image = images
-            height, width = image[0].shape[-2:]
+            ctrl_image = ctrl_images
+            height, width = ctrl_image[0].shape[-2:]
         else:
             assert False
 
@@ -572,16 +657,17 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         self._num_timesteps = len(timesteps)
 
         # 6. Prepare latent variables (unet에 입력으로 들어가서 이미지 생성의 기반이 될 latent 생성하는 부분.)
-        num_channels_latents = self.unet.config.in_channels
+        num_channels_latents = self.vae.config.latent_channels # Inpainting
+        num_channels_unet = self.unet.config.in_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
+            num_channels_latents=num_channels_unet,
+            height=height,
+            width=width,
+            dtype=prompt_embeds.dtype,
+            device=device,
+            generator=generator,
+            latents=latents,
         )
 
         # 6.5 Optionally get Guidance Scale Embedding
@@ -605,10 +691,10 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
 
         # 7.2 Prepare added time ids & embeddings (텍스트와 관련된 임베딩과 추가적인 time_ids를 생성해 이미지 생성에 필요한 정보들을 효율적으로 준비하는 과정)
-        if isinstance(image, list):
-            original_size = original_size or image[0].shape[-2:]
+        if isinstance(ctrl_image, list):
+            original_size = original_size or ctrl_image[0].shape[-2:]
         else:
-            original_size = original_size or image.shape[-2:]
+            original_size = original_size or ctrl_image.shape[-2:]
         target_size = target_size or (height, width)
 
         # text embedding에서 pooling된 정보를 사용한다.
@@ -645,7 +731,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
-        encoder_hidden_states = torch.cat([prompt_embeds, prompt_image_emb], dim=1)
+        encoder_hidden_states = torch.cat([prompt_embeds, prompt_image_emb], dim=1) # Inpainting에 없음
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -695,7 +781,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                     control_model_input,
                     t,
                     encoder_hidden_states=prompt_image_emb,
-                    controlnet_cond=image,
+                    controlnet_cond=ctrl_image,
                     conditioning_scale=cond_scale,
                     guess_mode=guess_mode,
                     added_cond_kwargs=controlnet_added_cond_kwargs,
@@ -771,25 +857,25 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             else:
                 latents = latents / self.vae.config.scaling_factor
 
-            image = self.vae.decode(latents, return_dict=False)[0]
+            output_image = self.vae.decode(latents, return_dict=False)[0]
 
             # cast back to fp16 if needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)
         else:
-            image = latents
+            output_image = latents
 
         if not output_type == "latent":
             # apply watermark if available
             if self.watermark is not None:
-                image = self.watermark.apply_watermark(image)
+                output_image = self.watermark.apply_watermark(output_image)
 
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            output_image = self.image_processor.postprocess(output_image, output_type=output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image,)
+            return (output_image,)
 
-        return StableDiffusionXLPipelineOutput(images=image)
+        return StableDiffusionXLPipelineOutput(images=output_image)

@@ -7,7 +7,10 @@ from diffusers.utils import load_image
 from diffusers.models import ControlNetModel
 
 from insightface.app import FaceAnalysis
-from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
+# from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
+from pipeline_reid import StableDiffusionXLInstantIDPipeline, draw_kps
+# from diffusers.src.diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_inpaint import StableDiffusionXLInpaintPipeline
+# from diffusers import StableDiffusionXLInpaintPipeline
 
 def resize_img(input_image, max_side=1280, min_side=1024, size=None, 
                pad_to_max_side=False, mode=Image.BILINEAR, base_pixel_number=64):
@@ -43,6 +46,7 @@ if __name__ == "__main__":
     controlnet_path = f'./checkpoints/ControlNetModel'
 
     # Load pipeline
+    # IdentityNet을 위한 ControlNet
     controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch.float16)
 
     base_model_path = 'stabilityai/stable-diffusion-xl-base-1.0'
@@ -67,15 +71,25 @@ if __name__ == "__main__":
     face_emb = face_info['embedding']
     face_kps = draw_kps(face_image, face_info['kps'])
 
+    mask_image = load_image("../../images/face_mask_image.jpg")
+    face_image = face_image.convert("RGB")
+    mask_image = mask_image.convert("RGB")
+
     image = pipe(
         prompt='',
         # negative_prompt=n_prompt,
-        image_embeds=face_emb,
-        image=face_kps,
-        controlnet_conditioning_scale=0.8,
-        ip_adapter_scale=0.8,
-        num_inference_steps=30,
-        guidance_scale=5,
+        init_image = face_image,
+        mask_image = mask_image,
+        ctrl_image_embeds=face_emb,
+        ctrl_image=face_kps,
+        # controlnet_conditioning_scale=0.8,
+        # ip_adapter_scale=0.8,
+        # ip_adapter_scale=1,
+        eta=0.0,
+        strength=0.1,
+        num_inference_steps=100,
+        guidance_scale=3,
     ).images[0]
 
+    # print(pipe)
     image.save('result.jpg')
