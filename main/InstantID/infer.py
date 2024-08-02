@@ -9,8 +9,9 @@ from diffusers.models import ControlNetModel
 from insightface.app import FaceAnalysis
 # from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
 from pipeline_reid import StableDiffusionXLInstantIDPipeline, draw_kps
-# from diffusers.src.diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_inpaint import StableDiffusionXLInpaintPipeline
-# from diffusers import StableDiffusionXLInpaintPipeline
+# from diffusers import StableDiffusionXLInpaintPipeline, DDIMScheduler
+
+from sklearn.metrics.pairwise import cosine_similarity
 
 def resize_img(input_image, max_side=1280, min_side=1024, size=None, 
                pad_to_max_side=False, mode=Image.BILINEAR, base_pixel_number=64):
@@ -59,10 +60,6 @@ if __name__ == "__main__":
     pipe.cuda()
     pipe.load_ip_adapter_instantid(face_adapter)
 
-    # Infer setting
-    # prompt = "analog film photo of a man. faded film, desaturated, 35mm photo, grainy, vignette, vintage, Kodachrome, Lomography, stained, highly detailed, found footage, masterpiece, best quality"
-    # n_prompt = "(lowres, low quality, worst quality:1.2), (text:1.2), watermark, painting, drawing, illustration, glitch, deformed, mutated, cross-eyed, ugly, disfigured (lowres, low quality, worst quality:1.2), (text:1.2), watermark, painting, drawing, illustration, glitch,deformed, mutated, cross-eyed, ugly, disfigured"
-
     face_image = load_image("../../images/testImage.png")
     face_image = resize_img(face_image)
 
@@ -75,21 +72,34 @@ if __name__ == "__main__":
     face_image = face_image.convert("RGB")
     mask_image = mask_image.convert("RGB")
 
-    image = pipe(
+    image, face_embed = pipe(
         prompt='',
         # negative_prompt=n_prompt,
+        # image_embeds=face_emb,
+        # image=face_kps,
+        # controlnet_conditioning_scale=0.8,
+        # ip_adapter_scale=0.8,
+        num_inference_steps=100,
+        guidance_scale=0,
         init_image = face_image,
         mask_image = mask_image,
         ctrl_image_embeds=face_emb,
         ctrl_image=face_kps,
-        # controlnet_conditioning_scale=0.8,
-        # ip_adapter_scale=0.8,
-        # ip_adapter_scale=1,
+        ip_adapter_scale=1,
+        ip_adapter_image = face_image,
         eta=0.0,
         strength=0.1,
-        num_inference_steps=100,
-        guidance_scale=3,
-    ).images[0]
+    )
 
+    image = image.images[0]
     # print(pipe)
     image.save('result.jpg')
+    # import pdb; pdb.set_trace()
+    # face_embed_info = app.get(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
+    # face_embed_info = sorted(face_embed_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
+    # face_embed = face_embed_info['embedding']
+    
+    face_embed = face_embed.reshape(-1,1)
+    face_emb = face_emb.reshape(-1,1)
+    similarity = cosine_similarity(face_embed, face_emb)[0]
+    print(f"\nSimilarity between Input image's face embedding and Optimized face embedding is : {similarity[0]}")
