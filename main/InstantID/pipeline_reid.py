@@ -213,17 +213,20 @@ class StableDiffusionXLInstantIDPipeline(
     ):
         super().__init__(vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, unet, controlnet, scheduler, force_zeros_for_empty_prompt, add_watermarker, feature_extractor, image_encoder)
 
-        print("@@@@@@\nImage Encoder load@@@@@@")
+        # print("@@@@@@\nImage Encoder load@@@@@@")
         self.image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
-        print("@@@@@@\nFeature extractor load@@@@@@")
+        # print("@@@@@@\nFeature extractor load@@@@@@")
         self.feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        print("@@@@@@\nDDIM load@@@@@@")
-        self.scheduler = DDIMScheduler.from_pretrained(
-            "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
-            subfolder="scheduler",
-        )
-        print("@@@@@@\nInpainting pipeline load@@@@@@")
+        # print("@@@@@@\nDDIM load@@@@@@")
+        # self.scheduler = DDIMScheduler.from_pretrained(
+        #     "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+        #     subfolder="scheduler",
+        # )
+        # Inpainting pipeline 생성
+        # print("@@@@@@\nInpainting pipeline load@@@@@@")
+        # self.inpainting_pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
         self.inpainting_pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+            # "runwayml/stable-diffusion-inpainting",
             "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
             torch_dtype=torch.float16,
             variant="fp16",
@@ -232,6 +235,7 @@ class StableDiffusionXLInstantIDPipeline(
             feature_extractor=self.feature_extractor,
             scheduler=self.scheduler
         )
+        self.inpainting_pipe.enable_model_cpu_offload()
 
         self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
         self.register_to_config(requires_aesthetics_score=requires_aesthetics_score)
@@ -244,23 +248,24 @@ class StableDiffusionXLInstantIDPipeline(
     
     def cuda(self, dtype=torch.float16, use_xformers=False): # cuda 설정
         self.to('cuda', dtype)
-        
+
         if hasattr(self, 'image_proj_model'):
             self.image_proj_model.to(self.unet.device).to(self.unet.dtype)
         
-        if use_xformers:
-            if is_xformers_available():
-                import xformers
-                from packaging import version
+        torch.cuda.empty_cache()
+        # if use_xformers:
+        #     if is_xformers_available():
+        #         import xformers
+        #         from packaging import version
 
-                xformers_version = version.parse(xformers.__version__)
-                if xformers_version == version.parse("0.0.16"):
-                    logger.warn(
-                        "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                    )
-                self.enable_xformers_memory_efficient_attention()
-            else:
-                raise ValueError("xformers is not available. Make sure it is installed correctly")
+        #         xformers_version = version.parse(xformers.__version__)
+        #         if xformers_version == version.parse("0.0.16"):
+        #             logger.warn(
+        #                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+        #             )
+        #         self.enable_xformers_memory_efficient_attention()
+        #     else:
+        #         raise ValueError("xformers is not available. Make sure it is installed correctly")
     
     def load_ip_adapter_instantid(self, model_ckpt, image_emb_dim=512, num_tokens=16, scale=0.5):     
         self.set_image_proj_model(model_ckpt, image_emb_dim, num_tokens)
@@ -818,6 +823,7 @@ class StableDiffusionXLInstantIDPipeline(
         self._denoising_start = denoising_start
         self._interrupt = False
 
+        import pdb
         # 2. Define call parameters (prompt 형식에 따라 배치 크기 설정)
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -984,7 +990,7 @@ class StableDiffusionXLInstantIDPipeline(
             inpainting_latents, noise, image_latents = latents_outputs
         else:
             inpainting_latents, noise = latents_outputs
-        # import pdb; pdb.set_trace()
+        
 
         # 7. Prepare mask latent variables
         mask, masked_image_latents = self.prepare_mask_latents(
@@ -1051,6 +1057,7 @@ class StableDiffusionXLInstantIDPipeline(
         else:
             text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
 
+        
         add_time_ids = self._get_add_time_ids(
             original_size,
             crops_coords_top_left,
@@ -1178,7 +1185,6 @@ class StableDiffusionXLInstantIDPipeline(
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
                 )[0]
-                # import pdb; pdb.set_trace()
 
                 # perform guidance (classifier_free_guidance 적용)
                 if self.do_classifier_free_guidance:
