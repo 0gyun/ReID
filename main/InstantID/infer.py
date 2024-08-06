@@ -9,7 +9,7 @@ from diffusers.models import ControlNetModel
 from insightface.app import FaceAnalysis
 # from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
 from pipeline_reid import StableDiffusionXLInstantIDPipeline, draw_kps
-# from diffusers import StableDiffusionXLInpaintPipeline, DDIMScheduler
+from diffusers import DDIMScheduler
 
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -48,6 +48,10 @@ if __name__ == "__main__":
 
     # Load pipeline
     # IdentityNet을 위한 ControlNet
+    scheduler = DDIMScheduler.from_pretrained(
+            "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+            subfolder="scheduler",
+        )
     controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch.float16)
 
     base_model_path = 'stabilityai/stable-diffusion-xl-base-1.0'
@@ -57,6 +61,7 @@ if __name__ == "__main__":
         controlnet=controlnet,
         torch_dtype=torch.float16,
     )
+    pipe.scheduler = scheduler
     pipe.cuda()
     pipe.load_ip_adapter_instantid(face_adapter)
 
@@ -74,32 +79,37 @@ if __name__ == "__main__":
 
     image, face_embed = pipe(
         prompt='',
-        # negative_prompt=n_prompt,
-        # image_embeds=face_emb,
-        # image=face_kps,
-        # controlnet_conditioning_scale=0.8,
-        # ip_adapter_scale=0.8,
         num_inference_steps=100,
         guidance_scale=0,
         init_image = face_image,
         mask_image = mask_image,
         ctrl_image_embeds=face_emb,
         ctrl_image=face_kps,
+        controlnet_conditioning_scale=0.8,
         ip_adapter_scale=1,
         ip_adapter_image = face_image,
         eta=0.0,
         strength=0.1,
     )
 
+    # image = pipe(
+    #     prompt='',
+    #     image_embeds=face_emb,
+    #     image=face_kps,
+    #     controlnet_conditioning_scale=0.8,
+    #     ip_adapter_scale=1,
+    #     num_inference_steps=50,
+    #     guidance_scale=5,
+    # ).images[0]
+
     image = image.images[0]
-    # print(pipe)
-    image.save('result.jpg')
+    image.save('reid_result.jpg')
     # import pdb; pdb.set_trace()
     # face_embed_info = app.get(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
     # face_embed_info = sorted(face_embed_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
     # face_embed = face_embed_info['embedding']
     
-    face_embed = face_embed.reshape(-1,1)
-    face_emb = face_emb.reshape(-1,1)
-    similarity = cosine_similarity(face_embed, face_emb)[0]
-    print(f"\nSimilarity between Input image's face embedding and Optimized face embedding is : {similarity[0]}")
+    # face_embed = face_embed.reshape(-1,1)
+    # face_emb = face_emb.reshape(-1,1)
+    # similarity = cosine_similarity(face_embed, face_emb)[0]
+    # print(f"\nSimilarity between Input image's face embedding and Optimized face embedding is : {similarity[0]}")
