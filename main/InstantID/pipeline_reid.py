@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import pdb
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -66,6 +66,13 @@ if is_torch2_available():
     from ip_adapter.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
 else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -190,6 +197,20 @@ def retrieve_latents(
 #         uncond_image_embeds = torch.zeros_like(image_embeds)
 
 #         return image_embeds, uncond_image_embeds
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
+def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
+    """
+    Rescale `noise_cfg` according to `guidance_rescale`. Based on findings of [Common Diffusion Noise Schedules and
+    Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
+    """
+    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    # rescale the results from guidance (fixes overexposure)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
+    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+    return noise_cfg
 
 class StableDiffusionXLInstantIDPipeline(
     StableDiffusionXLControlNetPipeline
@@ -330,23 +351,23 @@ class StableDiffusionXLInstantIDPipeline(
                 attn_processor.scale = scale
 
     def _encode_prompt_image_emb(self, prompt_image_emb, device, num_images_per_prompt, dtype, do_classifier_free_guidance):
-        
+        # (512,)
         if isinstance(prompt_image_emb, torch.Tensor):
             prompt_image_emb = prompt_image_emb.clone().detach()
         else:
             prompt_image_emb = torch.tensor(prompt_image_emb)
-            
+        # ([512])
         prompt_image_emb = prompt_image_emb.reshape([1, -1, self.image_proj_model_in_features])
-        
+        #([1, 1, 512])
         if do_classifier_free_guidance:
             prompt_image_emb = torch.cat([torch.zeros_like(prompt_image_emb), prompt_image_emb], dim=0)
         else:
             prompt_image_emb = torch.cat([prompt_image_emb], dim=0)
-        
+        # ([1, 1, 512])
         prompt_image_emb = prompt_image_emb.to(device=self.image_proj_model.latents.device, 
                                                dtype=self.image_proj_model.latents.dtype)
         prompt_image_emb = self.image_proj_model(prompt_image_emb)
-
+        # ([1, 16, 2048])
         bs_embed, seq_len, _ = prompt_image_emb.shape
         prompt_image_emb = prompt_image_emb.repeat(1, num_images_per_prompt, 1)
         prompt_image_emb = prompt_image_emb.view(bs_embed * num_images_per_prompt, seq_len, -1)
@@ -393,7 +414,7 @@ class StableDiffusionXLInstantIDPipeline(
             image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
         elif return_image_latents or (latents is None and not is_strength_max):
             image = image.to(device=device, dtype=dtype)
-            image_latents = self._encode_vae_image(image=image, generator=generator)
+            image_latents = self._encode_vae_image(image=image, generator=generator) # Image ([1, 3, 1024, 1024]) => Latent ([1, 4, 128, 128])
             image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
 
         if latents is None and add_noise:
@@ -754,7 +775,7 @@ class StableDiffusionXLInstantIDPipeline(
                 otherwise a `tuple` is returned containing the output images.
         """
 
-        # 콜백 함수와 관련된 설정
+        # 콜백 함수와 관련된 설정 (InstantID)
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
 
@@ -787,21 +808,21 @@ class StableDiffusionXLInstantIDPipeline(
             )
 
         # set unet to Inpainting Unet
-        self.inpainting_pipe.to(self._execution_device)
-        diffusion_unet = self.unet
-        self.unet = self.inpainting_pipe.unet
+        self.inpainting_pipe.to(self._execution_device) # Inpainting UNet
+        diffusion_unet = self.unet # InstantID UNet
+        self.unet = self.inpainting_pipe.unet # Inpainting UNet
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-        # 0. set ip_adapter_scale (ip adapter의 scale 설정)
+        # 0. set ip_adapter_scale (ip adapter의 scale 설정, InstantID)
         if ip_adapter_scale is not None:
             self.set_ip_adapter_scale(ip_adapter_scale)
 
         # 1. Check inputs. Raise error if not correct (입력 데이터 검증. 매개변수의 유효성 검사)
         self.check_inputs(
             prompt=prompt,
-            prompt_2=prompt_2,
+            prompt_2=prompt_2, 
             image=ctrl_image,
             callback_steps=callback_steps,
             negative_prompt=negative_prompt,
@@ -817,13 +838,13 @@ class StableDiffusionXLInstantIDPipeline(
         )
         # 내부 속성 설정
         self._guidance_scale = guidance_scale
+        self._guidance_rescale = guidance_rescale
         self._clip_skip = clip_skip
         self._cross_attention_kwargs = cross_attention_kwargs
         self._denoising_end = denoising_end
         self._denoising_start = denoising_start
         self._interrupt = False
 
-        import pdb
         # 2. Define call parameters (prompt 형식에 따라 배치 크기 설정)
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -870,7 +891,8 @@ class StableDiffusionXLInstantIDPipeline(
             clip_skip=self.clip_skip,
         )
         
-        # 3.2 Encode image prompt (Image embed는 ControlNet의 condition으로 들어갈 face embedding) => 우리가 최적화할 것.
+        # 이 부분 체크 필요!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 여기서 (512,) => ([1, 16, 2048])
+        # 3.2 Encode image prompt (Image embed는 ControlNet과 UNet에 condition으로 들어갈 face embedding) => 우리가 최적화할 것.
         prompt_image_emb = self._encode_prompt_image_emb(ctrl_image_embeds, 
                                                          device,
                                                          num_images_per_prompt,
@@ -919,26 +941,23 @@ class StableDiffusionXLInstantIDPipeline(
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
-        # at which timestep to set the initial noise (n.b. 50% if strength is 0.5)
+
+        # at which timestep to set the initial noise (n.b. 50% if strength is 0.5) (Inpainting)
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+        # create a boolean to check if the strength is set to 1. if so then initialise the latents with pure noise
+        is_strength_max = strength == 1.0
 
         # 5. Preprocess mask and image
-        if padding_mask_crop is not None:
-            crops_coords = self.mask_processor.get_crop_region(mask_image, width, height, pad=padding_mask_crop)
-            resize_mode = "fill"
-        else:
-            crops_coords = None
-            resize_mode = "default"
-
         original_image = init_image
-        init_image = self.image_processor.preprocess(
-            init_image, height=height, width=width, crops_coords=crops_coords, resize_mode=resize_mode
-        )
+        init_image = self.image_processor.preprocess(init_image, height=height, width=width)
         init_image = init_image.to(dtype=torch.float32)
-
-        mask = self.mask_processor.preprocess(
-            mask_image, height=height, width=width, resize_mode=resize_mode, crops_coords=crops_coords
-        )
+        mask = self.mask_processor.preprocess(mask_image, height=height, width=width)
+        # if padding_mask_crop is not None:
+        #     crops_coords = self.mask_processor.get_crop_region(mask_image, width, height, pad=padding_mask_crop)
+        #     resize_mode = "fill"
+        # else:
+        #     crops_coords = None
+        #     resize_mode = "default"
 
         if masked_image_latents is not None:
             masked_image = masked_image_latents
@@ -946,16 +965,16 @@ class StableDiffusionXLInstantIDPipeline(
             # if images are in latent space, we can't mask it
             masked_image = None
         else:
-            masked_image = init_image * (mask < 0.5)
+            masked_image = init_image * (mask < 0.5) # masked_image_latents를 안주기 때문에 이거로 간다.
 
         # 6. Prepare latent variables (unet에 입력으로 들어가서 이미지 생성의 기반이 될 latent 생성하는 부분.)
         num_channels_latents = self.vae.config.latent_channels # =4 Inpainting.
         num_channels_unet = diffusion_unet.config.in_channels # =4
         num_channels_inpainting_unet = self.unet.config.in_channels # =9
-        init_latents = latents
-        latents = self.prepare_latents(
+        init_latents = latents # 입력에 없었기에 None
+        latents = self.prepare_latents( # None -> ([1, 4, 128, 128])인 random tensor
             batch_size * num_images_per_prompt,
-            num_channels_latents=num_channels_unet, 
+            num_channels_latents=num_channels_unet, # IdentityNet을 위한 latent
             height=height,
             width=width,
             dtype=prompt_embeds.dtype,
@@ -964,12 +983,10 @@ class StableDiffusionXLInstantIDPipeline(
             latents=init_latents,
         )
 
-        return_image_latents = num_channels_unet == 4
-        # create a boolean to check if the strength is set to 1. if so then initialise the latents with pure noise
-        is_strength_max = strength == 1.0
+        return_image_latents = num_channels_inpainting_unet == 4
 
-        add_noise = True if self.denoising_start is None else False
-        latents_outputs = self.prepare_inpainting_latents(
+        add_noise = True if self.denoising_start is None else False # 따로 안주니까 True
+        latents_outputs = self.prepare_inpainting_latents( # 이미지 ([1, 3, 1024, 1024]) => latents ([1, 4, 128, 128])
             batch_size * num_images_per_prompt,
             num_channels_latents,
             height,
@@ -986,6 +1003,7 @@ class StableDiffusionXLInstantIDPipeline(
             return_image_latents=return_image_latents,
         )
 
+        # inpainting_latents ([1, 4, 128, 128]) / noise ([1, 4, 128, 128])
         if return_image_latents:
             inpainting_latents, noise, image_latents = latents_outputs
         else:
@@ -993,7 +1011,8 @@ class StableDiffusionXLInstantIDPipeline(
         
 
         # 7. Prepare mask latent variables
-        mask, masked_image_latents = self.prepare_mask_latents(
+        # mask ([1, 1, 1024, 1024]) -> ([1, 1, 128, 128]) / masked_image_latents ([1, 4, 128, 128])
+        mask, masked_image_latents = self.prepare_mask_latents( 
             mask,
             masked_image,
             batch_size * num_images_per_prompt,
@@ -1008,8 +1027,8 @@ class StableDiffusionXLInstantIDPipeline(
         # 8. Check that sizes of mask, masked image and latents match
         if num_channels_inpainting_unet == 9:
             # default case for runwayml/stable-diffusion-inpainting
-            num_channels_mask = mask.shape[1]
-            num_channels_masked_image = masked_image_latents.shape[1]
+            num_channels_mask = mask.shape[1] # 1
+            num_channels_masked_image = masked_image_latents.shape[1] # 4
             if num_channels_latents + num_channels_mask + num_channels_masked_image != self.unet.config.in_channels:
                 raise ValueError(
                     f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
@@ -1086,6 +1105,7 @@ class StableDiffusionXLInstantIDPipeline(
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
         encoder_hidden_states = torch.cat([prompt_embeds, prompt_image_emb], dim=1) # Inpainting에 없음
+        # pdb.set_trace()
 
         if ip_adapter_image is not None:
             output_hidden_state = False if isinstance(self.unet.encoder_hid_proj, ImageProjection) else True
@@ -1177,7 +1197,7 @@ class StableDiffusionXLInstantIDPipeline(
                 noise_pred = self.unet(
                     sample=inpainting_latent_model_input,
                     timestep=t,
-                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states=prompt_image_emb,
                     timestep_cond=timestep_cond,
                     cross_attention_kwargs=self.cross_attention_kwargs,
                     down_block_additional_residuals=down_block_res_samples,
@@ -1190,6 +1210,11 @@ class StableDiffusionXLInstantIDPipeline(
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+
 
                 # compute the previous noisy sample x_t -> x_t-1 (denoising step 수행. latent 업데이트)
                 inpainting_latents = self.scheduler.step(noise_pred, t, inpainting_latents, **extra_step_kwargs, return_dict=False)[0]
@@ -1222,6 +1247,12 @@ class StableDiffusionXLInstantIDPipeline(
                     negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
                     mask = callback_outputs.pop("mask", mask)
                     masked_image_latents = callback_outputs.pop("masked_image_latents", masked_image_latents)
+                    add_text_embeds = callback_outputs.pop("add_text_embeds", add_text_embeds)
+                    negative_pooled_prompt_embeds = callback_outputs.pop(
+                        "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
+                    )
+                    add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
+                    add_neg_time_ids = callback_outputs.pop("add_neg_time_ids", add_neg_time_ids)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -1230,6 +1261,9 @@ class StableDiffusionXLInstantIDPipeline(
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, inpainting_latents)
         
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16
             needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast

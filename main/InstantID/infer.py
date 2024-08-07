@@ -85,11 +85,10 @@ if __name__ == "__main__":
         mask_image = mask_image,
         ctrl_image_embeds=face_emb,
         ctrl_image=face_kps,
-        controlnet_conditioning_scale=0.8,
+        controlnet_conditioning_scale=1.0,
         ip_adapter_scale=1,
         ip_adapter_image = face_image,
-        eta=0.0,
-        strength=0.1,
+        strength=0.0008,
     )
 
     # image = pipe(

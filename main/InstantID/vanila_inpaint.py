@@ -1,7 +1,10 @@
+import cv2
 import torch
 import numpy as np
 from PIL import Image
 
+
+from insightface.app import FaceAnalysis
 from diffusers.utils import load_image
 from diffusers import StableDiffusionXLInpaintPipeline, DDIMScheduler
 
@@ -30,6 +33,13 @@ def resize_img(input_image, max_side=1280, min_side=1024, size=None,
 
 
 if __name__ == "__main__":
+    # Load face encoder
+    app = FaceAnalysis(name='antelopev2', root='./', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+
+    # Path to InstantID models
+    face_adapter = f'./checkpoints/ip-adapter.bin'
+
     # Vanila Inpainting
     model = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
     scheduler = DDIMScheduler.from_pretrained(
@@ -46,6 +56,10 @@ if __name__ == "__main__":
 
     face_image = load_image("../../images/testImage.png")
     face_image = resize_img(face_image)
+
+    face_info = app.get(cv2.cvtColor(np.array(face_image), cv2.COLOR_RGB2BGR))
+    face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
+    face_emb = face_info['embedding']
 
     mask_image = load_image("../../images/face_mask_image.jpg")
     face_image = face_image.convert("RGB")
