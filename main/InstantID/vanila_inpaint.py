@@ -7,6 +7,7 @@ from PIL import Image
 from insightface.app import FaceAnalysis
 from diffusers.utils import load_image
 from diffusers import StableDiffusionXLInpaintPipeline, DDIMScheduler
+# from diffusers1.src.diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_inpaint import StableDiffusionXLInpaintPipeline
 
 def resize_img(input_image, max_side=1280, min_side=1024, size=None, 
                pad_to_max_side=False, mode=Image.BILINEAR, base_pixel_number=64):
@@ -46,6 +47,7 @@ if __name__ == "__main__":
         model,
         subfolder="scheduler"
     )
+    # inpainting = StableDiffusionXLInpaintPipeline.from_pretrained(
     inpainting = StableDiffusionXLInpaintPipeline.from_pretrained(
         model,
         torch_dtype=torch.float16,
@@ -64,14 +66,17 @@ if __name__ == "__main__":
     mask_image = load_image("../../images/face_mask_image.jpg")
     face_image = face_image.convert("RGB")
     mask_image = mask_image.convert("RGB")
-
+    face_embed = torch.Tensor(face_emb)
+    face_embed = [face_embed.reshape([1, 1, -1])]
+    import pdb; pdb.set_trace()
     vanila_image = inpainting(
         prompt='',
         image=face_image,
         mask_image=mask_image,
         num_inference_steps=100,
         eta=0.0,
-        guidance_scale=7,
-        strength=0.01
+        guidance_scale=0,
+        strength=0.01,
+        ip_adapter_image_embeds=face_embed
     ).images[0]
-    vanila_image.save('vanila_result.jpg')
+    vanila_image.save('./results/vanila_result.jpg')

@@ -11,8 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+'''
+Reference files are pipeline_stable_diffusion_xl_instandid.py from InstantID and pipeline_stable_diffusion_xl_inpaint.py from diffusers.
+'''
 import pdb
+import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -30,6 +33,7 @@ from transformers import (
     CLIPVisionModelWithProjection,
 )
 
+from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import(
     FromSingleFileMixin,
@@ -54,9 +58,10 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.utils.torch_utils import is_compiled_module, is_torch_version
 from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipelineOutput
 
-from diffusers import StableDiffusionXLControlNetPipeline, StableDiffusionXLInpaintPipeline, DDIMScheduler
+from diffusers import StableDiffusionXLControlNetPipeline, DDIMScheduler
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers.utils.import_utils import is_xformers_available
+from pipeline_inpaint import StableDiffusionXLInpaintPipeline
 
 
 from ip_adapter.resampler import Resampler
@@ -159,44 +164,6 @@ def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,2
 
     out_img_pil = PIL.Image.fromarray(out_img.astype(np.uint8))
     return out_img_pil
-    
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
-def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
-):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
-
-# # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.encode_image
-# def encode_image(self, image, device, num_images_per_prompt, output_hidden_states=None):
-#     dtype = next(self.image_encoder.parameters()).dtype
-
-#     if not isinstance(image, torch.Tensor):
-#         image = self.feature_extractor(image, return_tensors="pt").pixel_values
-
-#     image = image.to(device=device, dtype=dtype)
-#     if output_hidden_states:
-#         image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
-#         image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
-#         uncond_image_enc_hidden_states = self.image_encoder(
-#             torch.zeros_like(image), output_hidden_states=True
-#         ).hidden_states[-2]
-#         uncond_image_enc_hidden_states = uncond_image_enc_hidden_states.repeat_interleave(
-#             num_images_per_prompt, dim=0
-#         )
-#         return image_enc_hidden_states, uncond_image_enc_hidden_states
-#     else:
-#         image_embeds = self.image_encoder(image).image_embeds
-#         image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
-#         uncond_image_embeds = torch.zeros_like(image_embeds)
-
-#         return image_embeds, uncond_image_embeds
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
@@ -212,9 +179,118 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
     return noise_cfg
 
+def mask_pil_to_torch(mask, height, width):
+    # preprocess mask
+    if isinstance(mask, (PIL.Image.Image, np.ndarray)):
+        mask = [mask]
+
+    if isinstance(mask, list) and isinstance(mask[0], PIL.Image.Image):
+        mask = [i.resize((width, height), resample=PIL.Image.LANCZOS) for i in mask]
+        mask = np.concatenate([np.array(m.convert("L"))[None, None, :] for m in mask], axis=0)
+        mask = mask.astype(np.float32) / 255.0
+    elif isinstance(mask, list) and isinstance(mask[0], np.ndarray):
+        mask = np.concatenate([m[None, None, :] for m in mask], axis=0)
+
+    mask = torch.from_numpy(mask)
+    return mask
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
+def retrieve_latents(
+    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
+
+# # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
+# def retrieve_timesteps(
+#     scheduler,
+#     num_inference_steps: Optional[int] = None,
+#     device: Optional[Union[str, torch.device]] = None,
+#     timesteps: Optional[List[int]] = None,
+#     sigmas: Optional[List[float]] = None,
+#     **kwargs,
+# ):
+#     """
+#     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+#     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+#     Args:
+#         scheduler (`SchedulerMixin`):
+#             The scheduler to get timesteps from.
+#         num_inference_steps (`int`):
+#             The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
+#             must be `None`.
+#         device (`str` or `torch.device`, *optional*):
+#             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+#         timesteps (`List[int]`, *optional*):
+#             Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
+#             `num_inference_steps` and `sigmas` must be `None`.
+#         sigmas (`List[float]`, *optional*):
+#             Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
+#             `num_inference_steps` and `timesteps` must be `None`.
+
+#     Returns:
+#         `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+#         second element is the number of inference steps.
+#     """
+#     if timesteps is not None and sigmas is not None:
+#         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+#     if timesteps is not None:
+#         accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+#         if not accepts_timesteps:
+#             raise ValueError(
+#                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+#                 f" timestep schedules. Please check whether you are using the correct scheduler."
+#             )
+#         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+#         timesteps = scheduler.timesteps
+#         num_inference_steps = len(timesteps)
+#     elif sigmas is not None:
+#         accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+#         if not accept_sigmas:
+#             raise ValueError(
+#                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+#                 f" sigmas schedules. Please check whether you are using the correct scheduler."
+#             )
+#         scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+#         timesteps = scheduler.timesteps
+#         num_inference_steps = len(timesteps)
+#     else:
+#         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+#         timesteps = scheduler.timesteps
+#     return timesteps, num_inference_steps
+
 class StableDiffusionXLInstantIDPipeline(
     StableDiffusionXLControlNetPipeline
 ):
+
+    model_cpu_offload_seq = "text_encoder->text_encoder_2->image_encoder->unet->vae"
+
+    _optional_components = [
+        "tokenizer",
+        "tokenizer_2",
+        "text_encoder",
+        "text_encoder_2",
+        "image_encoder",
+        "feature_extractor",
+    ]
+    _callback_tensor_inputs = [
+        "latents",
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "add_text_embeds",
+        "add_time_ids",
+        "negative_pooled_prompt_embeds",
+        "add_neg_time_ids",
+        "mask",
+        "masked_image_latents",
+    ]
 
     def __init__(
         self,
@@ -234,18 +310,13 @@ class StableDiffusionXLInstantIDPipeline(
     ):
         super().__init__(vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, unet, controlnet, scheduler, force_zeros_for_empty_prompt, add_watermarker, feature_extractor, image_encoder)
 
-        # print("@@@@@@\nImage Encoder load@@@@@@")
         self.image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
-        # print("@@@@@@\nFeature extractor load@@@@@@")
         self.feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        # print("@@@@@@\nDDIM load@@@@@@")
         # self.scheduler = DDIMScheduler.from_pretrained(
         #     "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
         #     subfolder="scheduler",
         # )
         # Inpainting pipeline 생성
-        # print("@@@@@@\nInpainting pipeline load@@@@@@")
-        # self.inpainting_pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
         self.inpainting_pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
             # "runwayml/stable-diffusion-inpainting",
             "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
@@ -258,6 +329,17 @@ class StableDiffusionXLInstantIDPipeline(
         )
         self.inpainting_pipe.enable_model_cpu_offload()
 
+        self.register_modules(
+            vae=vae,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            unet=unet,
+            image_encoder=image_encoder,
+            feature_extractor=feature_extractor,
+            scheduler=scheduler,
+        )
         self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
         self.register_to_config(requires_aesthetics_score=requires_aesthetics_score)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
@@ -266,7 +348,104 @@ class StableDiffusionXLInstantIDPipeline(
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
         )
 
-    
+        # add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
+
+        # if add_watermarker:
+        #     self.watermark = StableDiffusionXLWatermarker()
+        # else:
+        #     self.watermark = None
+
+    def check_inputs_4_inpainting(
+        self,
+        image,
+        mask_image,
+        height,
+        width,
+        strength,
+        output_type,
+        ip_adapter_image=None,
+        ip_adapter_image_embeds=None,
+        padding_mask_crop=None,
+    ):
+        if strength < 0 or strength > 1:
+            raise ValueError(f"The value of strength should in [0.0, 1.0] but is {strength}")
+
+        if height % 8 != 0 or width % 8 != 0:
+            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+
+        if padding_mask_crop is not None:
+            if not isinstance(image, PIL.Image.Image):
+                raise ValueError(
+                    f"The image should be a PIL image when inpainting mask crop, but is of type" f" {type(image)}."
+                )
+            if not isinstance(mask_image, PIL.Image.Image):
+                raise ValueError(
+                    f"The mask image should be a PIL image when inpainting mask crop, but is of type"
+                    f" {type(mask_image)}."
+                )
+            if output_type != "pil":
+                raise ValueError(f"The output type should be PIL when inpainting mask crop, but is" f" {output_type}.")
+        if ip_adapter_image is not None and ip_adapter_image_embeds is not None:
+            raise ValueError(
+                "Provide either `ip_adapter_image` or `ip_adapter_image_embeds`. Cannot leave both `ip_adapter_image` and `ip_adapter_image_embeds` defined."
+            )
+
+        if ip_adapter_image_embeds is not None:
+            if not isinstance(ip_adapter_image_embeds, list):
+                raise ValueError(
+                    f"`ip_adapter_image_embeds` has to be of type `list` but is {type(ip_adapter_image_embeds)}"
+                )
+            elif ip_adapter_image_embeds[0].ndim not in [3, 4]:
+                raise ValueError(
+                    f"`ip_adapter_image_embeds` has to be a list of 3D or 4D tensors but is {ip_adapter_image_embeds[0].ndim}D"
+                )
+
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_ip_adapter_image_embeds
+    def prepare_ip_adapter_image_embeds(
+        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
+    ):
+        image_embeds = []
+        if do_classifier_free_guidance:
+            negative_image_embeds = []
+        if ip_adapter_image_embeds is None:
+            if not isinstance(ip_adapter_image, list):
+                ip_adapter_image = [ip_adapter_image]
+
+            if len(ip_adapter_image) != len(self.unet.encoder_hid_proj.image_projection_layers):
+                raise ValueError(
+                    f"`ip_adapter_image` must have same length as the number of IP Adapters. Got {len(ip_adapter_image)} images and {len(self.unet.encoder_hid_proj.image_projection_layers)} IP Adapters."
+                )
+
+            for single_ip_adapter_image, image_proj_layer in zip(
+                ip_adapter_image, self.unet.encoder_hid_proj.image_projection_layers
+            ):
+                output_hidden_state = not isinstance(image_proj_layer, ImageProjection)
+                single_image_embeds, single_negative_image_embeds = self.encode_image(
+                    single_ip_adapter_image, device, 1, output_hidden_state
+                )
+
+                image_embeds.append(single_image_embeds[None, :])
+                if do_classifier_free_guidance:
+                    negative_image_embeds.append(single_negative_image_embeds[None, :])
+        else:
+            for single_image_embeds in ip_adapter_image_embeds:
+                if do_classifier_free_guidance:
+                    single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
+                    negative_image_embeds.append(single_negative_image_embeds)
+                image_embeds.append(single_image_embeds)
+
+        ip_adapter_image_embeds = []
+        for i, single_image_embeds in enumerate(image_embeds):
+            single_image_embeds = torch.cat([single_image_embeds] * num_images_per_prompt, dim=0)
+            if do_classifier_free_guidance:
+                single_negative_image_embeds = torch.cat([negative_image_embeds[i]] * num_images_per_prompt, dim=0)
+                single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds], dim=0)
+
+            single_image_embeds = single_image_embeds.to(device=device)
+            ip_adapter_image_embeds.append(single_image_embeds)
+
+        return ip_adapter_image_embeds
+            
     def cuda(self, dtype=torch.float16, use_xformers=False): # cuda 설정
         self.to('cuda', dtype)
 
@@ -394,8 +573,8 @@ class StableDiffusionXLInstantIDPipeline(
         shape = (
             batch_size,
             num_channels_latents,
-            int(height) // self.vae_scale_factor,
-            int(width) // self.vae_scale_factor,
+            height // self.vae_scale_factor,
+            width // self.vae_scale_factor,
         )
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
@@ -516,9 +695,133 @@ class StableDiffusionXLInstantIDPipeline(
 
         return mask, masked_image_latents
 
+    # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img.StableDiffusionXLImg2ImgPipeline.get_timesteps
+    def get_timesteps(self, num_inference_steps, strength, device, denoising_start=None):
+        # get the original timestep using init_timestep
+        if denoising_start is None:
+            init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+            t_start = max(num_inference_steps - init_timestep, 0)
+        else:
+            t_start = 0
+
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+
+        # Strength is irrelevant if we directly request a timestep to start at;
+        # that is, strength is determined by the denoising_start instead.
+        if denoising_start is not None:
+            discrete_timestep_cutoff = int(
+                round(
+                    self.scheduler.config.num_train_timesteps
+                    - (denoising_start * self.scheduler.config.num_train_timesteps)
+                )
+            )
+
+            num_inference_steps = (timesteps < discrete_timestep_cutoff).sum().item()
+            if self.scheduler.order == 2 and num_inference_steps % 2 == 0:
+                # if the scheduler is a 2nd order scheduler we might have to do +1
+                # because `num_inference_steps` might be even given that every timestep
+                # (except the highest one) is duplicated. If `num_inference_steps` is even it would
+                # mean that we cut the timesteps in the middle of the denoising step
+                # (between 1st and 2nd devirative) which leads to incorrect results. By adding 1
+                # we ensure that the denoising process always ends after the 2nd derivate step of the scheduler
+                num_inference_steps = num_inference_steps + 1
+
+            # because t_n+1 >= t_n, we slice the timesteps starting from the end
+            timesteps = timesteps[-num_inference_steps:]
+            return timesteps, num_inference_steps
+
+        return timesteps, num_inference_steps - t_start
+
+    # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img.StableDiffusionXLImg2ImgPipeline._get_add_time_ids
+    def _get_add_time_ids2(
+        self,
+        original_size,
+        crops_coords_top_left,
+        target_size,
+        aesthetic_score,
+        negative_aesthetic_score,
+        negative_original_size,
+        negative_crops_coords_top_left,
+        negative_target_size,
+        dtype,
+        text_encoder_projection_dim=None,
+    ):
+        if self.config.requires_aesthetics_score:
+            add_time_ids = list(original_size + crops_coords_top_left + (aesthetic_score,))
+            add_neg_time_ids = list(
+                negative_original_size + negative_crops_coords_top_left + (negative_aesthetic_score,)
+            )
+        else:
+            add_time_ids = list(original_size + crops_coords_top_left + target_size)
+            add_neg_time_ids = list(negative_original_size + crops_coords_top_left + negative_target_size)
+
+        passed_add_embed_dim = (
+            self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+        )
+        expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
+
+        if (
+            expected_add_embed_dim > passed_add_embed_dim
+            and (expected_add_embed_dim - passed_add_embed_dim) == self.unet.config.addition_time_embed_dim
+        ):
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. Please make sure to enable `requires_aesthetics_score` with `pipe.register_to_config(requires_aesthetics_score=True)` to make sure `aesthetic_score` {aesthetic_score} and `negative_aesthetic_score` {negative_aesthetic_score} is correctly used by the model."
+            )
+        elif (
+            expected_add_embed_dim < passed_add_embed_dim
+            and (passed_add_embed_dim - expected_add_embed_dim) == self.unet.config.addition_time_embed_dim
+        ):
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. Please make sure to disable `requires_aesthetics_score` with `pipe.register_to_config(requires_aesthetics_score=False)` to make sure `target_size` {target_size} is correctly used by the model."
+            )
+        elif expected_add_embed_dim != passed_add_embed_dim:
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+            )
+
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+        add_neg_time_ids = torch.tensor([add_neg_time_ids], dtype=dtype)
+
+        return add_time_ids, add_neg_time_ids
+    
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def guidance_rescale(self):
+        return self._guidance_rescale
+
+    @property
+    def clip_skip(self):
+        return self._clip_skip
+
+    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # corresponds to doing no classifier free guidance.
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1 and self.unet.config.time_cond_proj_dim is None
+
+    @property
+    def cross_attention_kwargs(self):
+        return self._cross_attention_kwargs
+
+    @property
+    def denoising_end(self):
+        return self._denoising_end
+    
     @property
     def denoising_start(self):
         return self._denoising_start
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
+
+    @property
+    def interrupt(self):
+        return self._interrupt
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -566,9 +869,8 @@ class StableDiffusionXLInstantIDPipeline(
         init_image: PipelineImageInput = None,
         mask_image: PipelineImageInput = None,
         masked_image_latents: torch.Tensor = None,
-        padding_mask_crop: Optional[int] = None,
+        strength: float = 0.3,
         timesteps: List[int] = None,
-        sigmas: List[float] = None,
         denoising_start: Optional[float] = None,
         denoising_end: Optional[float] = None,
         ip_adapter_image: Optional[PipelineImageInput] = None,
@@ -576,7 +878,8 @@ class StableDiffusionXLInstantIDPipeline(
         guidance_rescale: float = 0.0,
         aesthetic_score: float = 6.0,
         negative_aesthetic_score: float = 2.5,
-        strength: float = 0.3,
+        padding_mask_crop: Optional[int] = None,
+        sigmas: List[float] = None,
 
         **kwargs,
     ):
@@ -794,6 +1097,9 @@ class StableDiffusionXLInstantIDPipeline(
 
         # ControlNet 설정, 입력 형식 조정, 지침 형식 조정
         controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # align format for control guidance
         if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
@@ -811,9 +1117,6 @@ class StableDiffusionXLInstantIDPipeline(
         self.inpainting_pipe.to(self._execution_device) # Inpainting UNet
         diffusion_unet = self.unet # InstantID UNet
         self.unet = self.inpainting_pipe.unet # Inpainting UNet
-        # 0. Default height and width to unet
-        height = height or self.unet.config.sample_size * self.vae_scale_factor
-        width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # 0. set ip_adapter_scale (ip adapter의 scale 설정, InstantID)
         if ip_adapter_scale is not None:
@@ -835,6 +1138,15 @@ class StableDiffusionXLInstantIDPipeline(
             control_guidance_start=control_guidance_start,
             control_guidance_end=control_guidance_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+        )
+        self.check_inputs_4_inpainting(
+            image=init_image,
+            mask_image=mask_image,
+            height=height,
+            width=width,
+            strength=strength,
+            output_type=output_type,
+            padding_mask_crop=padding_mask_crop,
         )
         # 내부 속성 설정
         self._guidance_scale = guidance_scale
@@ -941,6 +1253,24 @@ class StableDiffusionXLInstantIDPipeline(
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
+        # 4. set timesteps retrieve_timesteps 함수에서 scheduler.set_timestep인가가 문제였던 거로 기억한다.
+        def denoising_value_valid(dnv):
+            return isinstance(self.denoising_end, float) and 0 < dnv < 1
+        
+        # timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        # timesteps, num_inference_steps = self.get_timesteps(
+        #     num_inference_steps,
+        #     strength,
+        #     device,
+        #     denoising_start=self.denoising_start if denoising_value_valid else None,
+        # )
+        # # check that number of inference steps is not < 1 - as this doesn't make sense
+        # if num_inference_steps < 1:
+        #     raise ValueError(
+        #         f"After adjusting the num_inference_steps by strength parameter: {strength}, the number of pipeline"
+        #         f"steps is {num_inference_steps} which is < 1 and not appropriate for this pipeline."
+        #     )
+
 
         # at which timestep to set the initial noise (n.b. 50% if strength is 0.5) (Inpainting)
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
@@ -948,16 +1278,18 @@ class StableDiffusionXLInstantIDPipeline(
         is_strength_max = strength == 1.0
 
         # 5. Preprocess mask and image
-        original_image = init_image
+        if padding_mask_crop is not None:
+            crops_coords = self.mask_processor.get_crop_region(mask_image, width, height, pad=padding_mask_crop)
+            resize_mode = "fill"
+        else:
+            crops_coords = None
+            resize_mode = "default"
+            
+        original_image = init_image # original image = 원본 이미지.
         init_image = self.image_processor.preprocess(init_image, height=height, width=width)
         init_image = init_image.to(dtype=torch.float32)
+
         mask = self.mask_processor.preprocess(mask_image, height=height, width=width)
-        # if padding_mask_crop is not None:
-        #     crops_coords = self.mask_processor.get_crop_region(mask_image, width, height, pad=padding_mask_crop)
-        #     resize_mode = "fill"
-        # else:
-        #     crops_coords = None
-        #     resize_mode = "default"
 
         if masked_image_latents is not None:
             masked_image = masked_image_latents
@@ -969,12 +1301,16 @@ class StableDiffusionXLInstantIDPipeline(
 
         # 6. Prepare latent variables (unet에 입력으로 들어가서 이미지 생성의 기반이 될 latent 생성하는 부분.)
         num_channels_latents = self.vae.config.latent_channels # =4 Inpainting.
-        num_channels_unet = diffusion_unet.config.in_channels # =4
+        num_channels_denoising_unet = diffusion_unet.config.in_channels # =4
         num_channels_inpainting_unet = self.unet.config.in_channels # =9
+        
+        return_image_latents = num_channels_inpainting_unet == 4
+
         init_latents = latents # 입력에 없었기에 None
+        
         latents = self.prepare_latents( # None -> ([1, 4, 128, 128])인 random tensor
             batch_size * num_images_per_prompt,
-            num_channels_latents=num_channels_unet, # IdentityNet을 위한 latent
+            num_channels_latents=num_channels_denoising_unet, # IdentityNet을 위한 latent
             height=height,
             width=width,
             dtype=prompt_embeds.dtype,
@@ -983,7 +1319,6 @@ class StableDiffusionXLInstantIDPipeline(
             latents=init_latents,
         )
 
-        return_image_latents = num_channels_inpainting_unet == 4
 
         add_noise = True if self.denoising_start is None else False # 따로 안주니까 True
         latents_outputs = self.prepare_inpainting_latents( # 이미지 ([1, 3, 1024, 1024]) => latents ([1, 4, 128, 128])
@@ -994,7 +1329,7 @@ class StableDiffusionXLInstantIDPipeline(
             prompt_embeds.dtype,
             device,
             generator,
-            latents=init_latents,
+            latents=init_latents,#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
             image=init_image,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
@@ -1053,6 +1388,14 @@ class StableDiffusionXLInstantIDPipeline(
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        # 9. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        height, width = inpainting_latents.shape[-2:]
+        height = height * self.vae_scale_factor
+        width = width * self.vae_scale_factor
+
+        original_size = original_size or (height, width)
+        target_size = target_size or (height, width)
+
         # 7.1 Create tensor stating which controlnets to keep
         controlnet_keep = []
         for i in range(len(timesteps)):
@@ -1069,21 +1412,41 @@ class StableDiffusionXLInstantIDPipeline(
             original_size = original_size or ctrl_image.shape[-2:]
         target_size = target_size or (height, width)
 
+        # 10. Prepare added time ids & embeddings
+        if negative_original_size is None:
+            negative_original_size = original_size
+        if negative_target_size is None:
+            negative_target_size = target_size
+
         # text embedding에서 pooling된 정보를 사용한다.
         add_text_embeds = pooled_prompt_embeds
         if self.text_encoder_2 is None:
             text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
         else:
             text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
-
         
-        add_time_ids = self._get_add_time_ids(
+        add_time_ids, add_neg_time_ids = self._get_add_time_ids2(
             original_size,
             crops_coords_top_left,
             target_size,
+            aesthetic_score,
+            negative_aesthetic_score,
+            negative_original_size,
+            negative_crops_coords_top_left,
+            negative_target_size,
             dtype=prompt_embeds.dtype,
             text_encoder_projection_dim=text_encoder_projection_dim,
         )
+
+
+        # add_time_ids = self._get_add_time_ids(
+        #     original_size,
+        #     crops_coords_top_left,
+        #     target_size,
+        #     dtype=prompt_embeds.dtype,
+        #     text_encoder_projection_dim=text_encoder_projection_dim,
+        # )
+        add_time_ids = add_time_ids.repeat(batch_size * num_images_per_prompt, 1)
 
         if negative_original_size is not None and negative_target_size is not None:
             negative_add_time_ids = self._get_add_time_ids(
@@ -1099,29 +1462,52 @@ class StableDiffusionXLInstantIDPipeline(
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+            add_neg_time_ids = add_neg_time_ids.repeat(batch_size * num_images_per_prompt, 1)
             add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
         encoder_hidden_states = torch.cat([prompt_embeds, prompt_image_emb], dim=1) # Inpainting에 없음
-        # pdb.set_trace()
 
-        if ip_adapter_image is not None:
-            output_hidden_state = False if isinstance(self.unet.encoder_hid_proj, ImageProjection) else True
-            image_embeds, negative_image_embeds = self.encode_image(
-                ip_adapter_image, device, num_images_per_prompt, output_hidden_state
+        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+            image_embeds = self.prepare_ip_adapter_image_embeds(
+                ip_adapter_image,
+                ip_adapter_image_embeds,
+                device,
+                batch_size * num_images_per_prompt,
+                self.do_classifier_free_guidance,
             )
-            if self.do_classifier_free_guidance:
-                image_embeds = torch.cat([negative_image_embeds, image_embeds])
-                image_embeds = image_embeds.to(device)
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         is_unet_compiled = is_compiled_module(self.unet)
         is_controlnet_compiled = is_compiled_module(self.controlnet)
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
-                
+
+        if (
+            self.denoising_end is not None
+            and self.denoising_start is not None
+            and denoising_value_valid(self.denoising_end)
+            and denoising_value_valid(self.denoising_start)
+            and self.denoising_start >= self.denoising_end
+        ):
+            raise ValueError(
+                f"`denoising_start`: {self.denoising_start} cannot be larger than or equal to `denoising_end`: "
+                + f" {self.denoising_end} when using type float."
+            )
+        elif self.denoising_end is not None and denoising_value_valid(self.denoising_end):
+            discrete_timestep_cutoff = int(
+                round(
+                    self.scheduler.config.num_train_timesteps
+                    - (self.denoising_end * self.scheduler.config.num_train_timesteps)
+                )
+            )
+            num_inference_steps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
+            timesteps = timesteps[:num_inference_steps]
+
+        self._num_timesteps = len(timesteps)
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Relevant thread:
@@ -1129,20 +1515,22 @@ class StableDiffusionXLInstantIDPipeline(
                 if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
                     torch._inductor.cudagraph_mark_step_begin()
                 # expand the latents if we are doing classifier free guidance (latent 확장 및 조정)
+                # for InstantID IdentityNet
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # expand the latents if we are doing classifier free guidance
-                # inpainting_latent_model_input = torch.cat([inpainting_latents] * 2) if self.do_classifier_free_guidance else inpainting_latents
-                inpainting_latent_model_input = torch.cat([inpainting_latents] * 2) if self.do_classifier_free_guidance else inpainting_latents
-
                 # concat latents, mask, masked_image_latents in the channel dimension
+                # for Inpainting UNet
+                inpainting_latent_model_input = torch.cat([inpainting_latents] * 2) if self.do_classifier_free_guidance else inpainting_latents
                 inpainting_latent_model_input = self.scheduler.scale_model_input(inpainting_latent_model_input, t)
 
                 if num_channels_inpainting_unet == 9:
                     inpainting_latent_model_input = torch.cat([inpainting_latent_model_input, mask, masked_image_latents], dim=1)
 
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                if ip_adapter_image is not None:
+                    added_cond_kwargs["image_embeds"] = image_embeds
 
                 # Guess mode와 classifier-free guidance의 사용 유무로 latent 설정
                 # controlnet(s) inference
@@ -1190,14 +1578,14 @@ class StableDiffusionXLInstantIDPipeline(
 
                 # predict the noise residual
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                if ip_adapter_image is not None:
+                if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
 
                 # predict the noise residual (latent에 대한 noise 예측. down_block_res_samples와 mid_block_res_sample 포함해서 예측)
                 noise_pred = self.unet(
                     sample=inpainting_latent_model_input,
                     timestep=t,
-                    encoder_hidden_states=prompt_image_emb,
+                    encoder_hidden_states=encoder_hidden_states,
                     timestep_cond=timestep_cond,
                     cross_attention_kwargs=self.cross_attention_kwargs,
                     down_block_additional_residuals=down_block_res_samples,
@@ -1206,18 +1594,48 @@ class StableDiffusionXLInstantIDPipeline(
                     return_dict=False,
                 )[0]
 
+                # noise_pred_id = diffusion_unet(
+                #     latent_model_input,
+                #     t,
+                #     encoder_hidden_states=encoder_hidden_states,
+                #     timestep_cond=timestep_cond,
+                #     cross_attention_kwargs=self.cross_attention_kwargs,
+                #     down_block_additional_residuals=down_block_res_samples,
+                #     mid_block_additional_residual=mid_block_res_sample,
+                #     added_cond_kwargs=added_cond_kwargs,
+                #     return_dict=False,
+                # )[0]
+
                 # perform guidance (classifier_free_guidance 적용)
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                    # noise_pred_id_uncond, noise_pred_id_text = noise_pred_id.chunk(2)
+                    # noise_pred_id = noise_pred_id_uncond + guidance_scale * (noise_pred_id_text - noise_pred_id_uncond)
+
+                if self.do_classifier_free_guidance and self._guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self._guidance_rescale)
+                    
+                    # noise_pred_id = rescale_noise_cfg(noise_pred_id, noise_pred_id_text, guidance_rescale=self._guidance_rescale)
 
 
                 # compute the previous noisy sample x_t -> x_t-1 (denoising step 수행. latent 업데이트)
+                latents_dtype = inpainting_latents.dtype
                 inpainting_latents = self.scheduler.step(noise_pred, t, inpainting_latents, **extra_step_kwargs, return_dict=False)[0]
+                if inpainting_latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_abailable():
+                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        inpainting_latents = inpainting_latents.to(latents_dtype)
+                # latents_dtype = latents.dtype
+                # latents = self.scheduler.step(noise_pred_id, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                # if latents.dtype != latents_dtype:
+                #     if torch.backends.mps.is_abailable():
+                #         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                #         latents = latents.to(latents_dtype)
+                # latents = (1-mask) * inpainting_latents + mask * latents
+                # inpainting_latents = latents
 
                 if num_channels_inpainting_unet == 4:
                     init_latents_proper = image_latents
@@ -1242,17 +1660,19 @@ class StableDiffusionXLInstantIDPipeline(
                         callback_kwargs[k] = locals()[k]
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
+                    latents = callback_outputs.pop("latents", latents)
+                    
                     inpainting_latents = callback_outputs.pop("latents", inpainting_latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-                    mask = callback_outputs.pop("mask", mask)
-                    masked_image_latents = callback_outputs.pop("masked_image_latents", masked_image_latents)
                     add_text_embeds = callback_outputs.pop("add_text_embeds", add_text_embeds)
                     negative_pooled_prompt_embeds = callback_outputs.pop(
                         "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
                     )
                     add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
                     add_neg_time_ids = callback_outputs.pop("add_neg_time_ids", add_neg_time_ids)
+                    mask = callback_outputs.pop("mask", mask)
+                    masked_image_latents = callback_outputs.pop("masked_image_latents", masked_image_latents)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -1260,6 +1680,7 @@ class StableDiffusionXLInstantIDPipeline(
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, inpainting_latents)
+                        callback(step_idx, t, latents)
         
                 if XLA_AVAILABLE:
                     xm.mark_step()
@@ -1271,6 +1692,10 @@ class StableDiffusionXLInstantIDPipeline(
             if needs_upcasting:
                 self.upcast_vae()
                 inpainting_latents = inpainting_latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
+            elif inpainting_latents.dtype != self.vae.dtype:
+                if torch.backends.mps.is_available():
+                    # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                    self.vae = self.vae.to(inpainting_latents.dtype)
 
             # unscale/denormalize the latents
             # denormalize with the mean and std if available and not None
@@ -1284,16 +1709,27 @@ class StableDiffusionXLInstantIDPipeline(
                     torch.tensor(self.vae.config.latents_std).view(1, 4, 1, 1).to(inpainting_latents.device, inpainting_latents.dtype)
                 )
                 inpainting_latents = inpainting_latents * latents_std / self.vae.config.scaling_factor + latents_mean
+                # latents_mean = (
+                #     torch.tensor(self.vae.config.latents_mean).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+                # )
+                # latents_std = (
+                #     torch.tensor(self.vae.config.latents_std).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+                # )
+                # latents = latents * latents_std / self.vae.config.scaling_factor + latents_mean
             else:
                 inpainting_latents = inpainting_latents / self.vae.config.scaling_factor
+                # latents = latents / self.vae.config.scaling_factor
 
             output_image = self.vae.decode(inpainting_latents, return_dict=False)[0]
+            
+            # output_image_id = self.vae.decode(latents, return_dict=False)[0]
 
             # cast back to fp16 if needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)
         else:
             output_image = inpainting_latents
+            # output_image_id = latents
 
         if not output_type == "latent":
             # apply watermark if available
@@ -1301,6 +1737,10 @@ class StableDiffusionXLInstantIDPipeline(
                 output_image = self.watermark.apply_watermark(output_image)
 
             output_image = self.image_processor.postprocess(output_image, output_type=output_type)
+            # output_image_id = self.image_processor.postprocess(output_image_id, output_type=output_type)
+
+        if padding_mask_crop is not None:
+            output_image = [self.image_processor.apply_overlay(mask_image, original_image, i, crops_coords) for i in output_image]
 
         # Offload all models
         self.maybe_free_model_hooks()

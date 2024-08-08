@@ -72,6 +72,8 @@ if __name__ == "__main__":
     face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
     face_emb = face_info['embedding']
     face_kps = draw_kps(face_image, face_info['kps'])
+    face_embed = torch.Tensor(face_emb)
+    face_embed = [face_embed.reshape([1, 1, -1])]
 
     mask_image = load_image("../../images/face_mask_image.jpg")
     face_image = face_image.convert("RGB")
@@ -79,16 +81,17 @@ if __name__ == "__main__":
 
     image, face_embed = pipe(
         prompt='',
-        num_inference_steps=100,
+        num_inference_steps=30,
         guidance_scale=0,
-        init_image = face_image,
-        mask_image = mask_image,
-        ctrl_image_embeds=face_emb,
-        ctrl_image=face_kps,
+        init_image = face_image, # 원본 이미지
+        mask_image = mask_image, # 마스크 이미지1
+        ctrl_image_embeds=face_emb, # face embedding
+        ctrl_image=face_kps, # keypoints 그린 이미지
         controlnet_conditioning_scale=1.0,
         ip_adapter_scale=1,
-        ip_adapter_image = face_image,
-        strength=0.0008,
+        # ip_adapter_image = face_image,
+        ip_adapter_image_embeds=face_embed,
+        strength=0.1,
     )
 
     # image = pipe(
@@ -102,7 +105,9 @@ if __name__ == "__main__":
     # ).images[0]
 
     image = image.images[0]
-    image.save('reid_result.jpg')
+    # image1 = image1.images[0]
+    image.save('./results/reid_result.jpg')
+    # image1.save('./results/reid_result_비교.jpg')
     # import pdb; pdb.set_trace()
     # face_embed_info = app.get(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
     # face_embed_info = sorted(face_embed_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
