@@ -51,14 +51,20 @@ if __name__=="__main__":
     generator = torch.Generator(device="cpu").manual_seed(1)
 
     init_image = load_image("../../images/testImage.png").resize((1024,1024))
+    compare_image = load_image("../../images/musk_resize.jpeg").resize((1024,1024))
     mask_image = load_image("../../images/face_mask_image.jpg").resize((1024,1024))
     import pdb
     face_info = app.get(cv2.cvtColor(np.array(init_image), cv2.COLOR_RGB2BGR))
     face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
     face_emb = face_info['embedding'] # Face embedding
+    face_kps = draw_kps(init_image, face_info['kps'])
+
+    face_info2 = app.get(cv2.cvtColor(np.array(compare_image), cv2.COLOR_RGB2BGR))
+    face_info2 = sorted(face_info2, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
+    face_emb2 = face_info2['embedding'] # Face embedding
+
     face_embed = torch.Tensor(face_emb)
     face_embed = [face_embed.reshape([1, 1, -1])]
-    face_kps = draw_kps(init_image, face_info['kps'])
 
     controlnet = ControlNetModel.from_pretrained(
         controlnet_path,
@@ -70,22 +76,22 @@ if __name__=="__main__":
         controlnet=controlnet, 
         torch_dtype=torch.float16
     )
-
+    pipe.load_ip_adapter_instantid(face_adapter)
     pipe.enable_model_cpu_offload()
 
-
+    import pdb; pdb.set_trace()
     image = pipe(
         prompt='',
-        num_inference_steps=30,
+        num_inference_steps=100,
         generator=generator,
-        guidance_scale=0.0,
-        eta=0.0,
+        # guidance_scale=1.0,
         image=init_image,
         mask_image=mask_image,
         control_image=face_kps,
-        # ip_adapter_image=init_image,
-        ip_adapter_image_embeds=face_embed,
-        strength=0.1,
+        # ip_adapter_image=compare_image,
+        # ip_adapter_image_embeds=face_embed,
+        # strength=0.3,
+        # ip_adapter_scale=1.0,
     ).images[0]
 
     image.save('./results/ControlNetInpaintPipeline_result.jpg')

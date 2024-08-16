@@ -10,6 +10,7 @@ from insightface.app import FaceAnalysis
 # from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
 from pipeline_reid import StableDiffusionXLInstantIDPipeline, draw_kps
 from diffusers import DDIMScheduler
+import random
 
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -67,13 +68,29 @@ if __name__ == "__main__":
 
     face_image = load_image("../../images/testImage.png")
     face_image = resize_img(face_image)
+    compare_image = load_image("../../images/yann-lecun_resize.jpg")
+    compare_image = resize_img(compare_image)
 
-    face_info = app.get(cv2.cvtColor(np.array(face_image), cv2.COLOR_RGB2BGR))
-    face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
-    face_emb = face_info['embedding']
-    face_kps = draw_kps(face_image, face_info['kps'])
+    face_emb = np.loadtxt("face_emb1471.txt")
+    face_emb2 = np.loadtxt("face_emb2_1471.txt")
+    face_kps = load_image("face_kps1471.jpg")
+    face_kps2 = load_image("face_kps2_1471.jpg")
+
+    # face_info = app.get(cv2.cvtColor(np.array(face_image), cv2.COLOR_RGB2BGR))
+    # face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
+    # face_emb = face_info['embedding']
+    # face_kps = draw_kps(face_image, face_info['kps'])
     face_embed = torch.Tensor(face_emb)
     face_embed = [face_embed.reshape([1, 1, -1])]
+    # a = random.randint(0, 10000)
+    # np.savetxt(f"face_emb{a}.txt", face_emb)
+    # face_kps.save(f"face_kps{a}.jpg")
+    # face_info2 = app.get(cv2.cvtColor(np.array(compare_image), cv2.COLOR_RGB2BGR))
+    # face_info2 = sorted(face_info2, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
+    # face_emb2 = face_info2['embedding'] # Face embedding
+    # face_kps2 = draw_kps(compare_image, face_info2['kps'])
+    # np.savetxt(f"face_emb2_{a}.txt", face_emb2)
+    # face_kps2.save(f"face_kps2_{a}.jpg")
 
     mask_image = load_image("../../images/face_mask_image.jpg")
     face_image = face_image.convert("RGB")

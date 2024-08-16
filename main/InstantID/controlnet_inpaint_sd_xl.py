@@ -55,11 +55,20 @@ from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
-
+from diffusers import StableDiffusionXLControlNetPipeline
 
 if is_invisible_watermark_available():
     from diffusers.pipelines.stable_diffusion_xl.watermark import StableDiffusionXLWatermarker
 
+from diffusers.utils.import_utils import is_xformers_available
+
+from ip_adapter.resampler import Resampler
+from ip_adapter.utils import is_torch2_available
+
+if is_torch2_available():
+    from ip_adapter.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
+else:
+    from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -151,12 +160,8 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
 
 
 class StableDiffusionXLControlNetInpaintPipeline(
-    DiffusionPipeline,
-    StableDiffusionMixin,
-    StableDiffusionXLLoraLoaderMixin,
-    FromSingleFileMixin,
-    IPAdapterMixin,
-    TextualInversionLoaderMixin,
+    # DiffusionPipeline,
+    StableDiffusionXLControlNetPipeline,
 ):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion XL.
@@ -234,7 +239,7 @@ class StableDiffusionXLControlNetInpaintPipeline(
         feature_extractor: Optional[CLIPImageProcessor] = None,
         image_encoder: Optional[CLIPVisionModelWithProjection] = None,
     ):
-        super().__init__()
+        super().__init__(vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, unet, controlnet, scheduler, force_zeros_for_empty_prompt, add_watermarker, feature_extractor, image_encoder)
 
         if isinstance(controlnet, (list, tuple)):
             controlnet = MultiControlNetModel(controlnet)
@@ -258,16 +263,92 @@ class StableDiffusionXLControlNetInpaintPipeline(
         self.mask_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
         )
-        self.control_image_processor = VaeImageProcessor(
-            vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True, do_normalize=False
+        # self.control_image_processor = VaeImageProcessor(
+        #     vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True, do_normalize=False
+        # )
+
+        # add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
+
+        # if add_watermarker:
+        #     self.watermark = StableDiffusionXLWatermarker()
+        # else:
+        #     self.watermark = None
+
+    def cuda(self, dtype=torch.float16, use_xformers=False): # cuda 설정
+        self.to('cuda', dtype)
+        
+        if hasattr(self, 'image_proj_model'):
+            self.image_proj_model.to(self.unet.device).to(self.unet.dtype)
+        
+        if use_xformers:
+            if is_xformers_available():
+                import xformers
+                from packaging import version
+
+                xformers_version = version.parse(xformers.__version__)
+                if xformers_version == version.parse("0.0.16"):
+                    logger.warn(
+                        "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                    )
+                self.enable_xformers_memory_efficient_attention()
+            else:
+                raise ValueError("xformers is not available. Make sure it is installed correctly")
+    
+    def load_ip_adapter_instantid(self, model_ckpt, image_emb_dim=512, num_tokens=16, scale=0.5):     
+        self.set_image_proj_model(model_ckpt, image_emb_dim, num_tokens)
+        self.set_ip_adapter(model_ckpt, num_tokens, scale)
+        
+    def set_image_proj_model(self, model_ckpt, image_emb_dim=512, num_tokens=16):
+        
+        image_proj_model = Resampler(
+            dim=1280,
+            depth=4,
+            dim_head=64,
+            heads=20,
+            num_queries=num_tokens,
+            embedding_dim=image_emb_dim,
+            output_dim=self.unet.config.cross_attention_dim,
+            ff_mult=4,
         )
 
-        add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
-
-        if add_watermarker:
-            self.watermark = StableDiffusionXLWatermarker()
-        else:
-            self.watermark = None
+        image_proj_model.eval()
+        
+        self.image_proj_model = image_proj_model.to(self.device, dtype=self.dtype)
+        state_dict = torch.load(model_ckpt, map_location="cpu")
+        if 'image_proj' in state_dict:
+            state_dict = state_dict["image_proj"]
+        self.image_proj_model.load_state_dict(state_dict)
+        
+        self.image_proj_model_in_features = image_emb_dim
+    
+    def set_ip_adapter(self, model_ckpt, num_tokens, scale):
+        
+        unet = self.unet
+        attn_procs = {}
+        for name in unet.attn_processors.keys():
+            cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = unet.config.block_out_channels[block_id]
+            if cross_attention_dim is None:
+                attn_procs[name] = AttnProcessor().to(unet.device, dtype=unet.dtype)
+            else:
+                attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, 
+                                                   cross_attention_dim=cross_attention_dim, 
+                                                   scale=scale,
+                                                   num_tokens=num_tokens).to(unet.device, dtype=unet.dtype)
+        unet.set_attn_processor(attn_procs)
+        
+        state_dict = torch.load(model_ckpt, map_location="cpu")
+        ip_layers = torch.nn.ModuleList(self.unet.attn_processors.values())
+        if 'ip_adapter' in state_dict:
+            state_dict = state_dict['ip_adapter']
+        ip_layers.load_state_dict(state_dict)
 
     # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl.StableDiffusionXLPipeline.encode_prompt
     def encode_prompt(
@@ -531,8 +612,30 @@ class StableDiffusionXLControlNetInpaintPipeline(
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_ip_adapter_image_embeds
     def prepare_ip_adapter_image_embeds(
-        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
+        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance, dtype
     ):
+        # if isinstance(ip_adapter_image_embeds, torch.Tensor):
+        #     ip_adapter_image_embeds = ip_adapter_image_embeds.clone().detach()
+        # else:
+        #     ip_adapter_image_embeds = torch.tensor(ip_adapter_image_embeds)
+            
+        # ip_adapter_image_embeds = ip_adapter_image_embeds.reshape([1, -1, self.image_proj_model_in_features])
+        
+        # if do_classifier_free_guidance:
+        #     ip_adapter_image_embeds = torch.cat([torch.zeros_like(ip_adapter_image_embeds), ip_adapter_image_embeds], dim=0)
+        # else:
+        #     ip_adapter_image_embeds = torch.cat([ip_adapter_image_embeds], dim=0)
+        
+        # ip_adapter_image_embeds = ip_adapter_image_embeds.to(device=self.image_proj_model.latents.device, 
+        #                                        dtype=self.image_proj_model.latents.dtype)
+        # ip_adapter_image_embeds = self.image_proj_model(ip_adapter_image_embeds)
+
+        # bs_embed, seq_len, _ = ip_adapter_image_embeds.shape
+        # ip_adapter_image_embeds = ip_adapter_image_embeds.repeat(1, num_images_per_prompt, 1)
+        # ip_adapter_image_embeds = ip_adapter_image_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        
+        # return ip_adapter_image_embeds.to(device=device, dtype=dtype)
+
         image_embeds = []
         if do_classifier_free_guidance:
             negative_image_embeds = []
@@ -558,7 +661,7 @@ class StableDiffusionXLControlNetInpaintPipeline(
                     negative_image_embeds.append(single_negative_image_embeds[None, :])
         else:
             for single_image_embeds in ip_adapter_image_embeds:
-                if do_classifier_free_guidance:
+                if do_classifier_free_guidance and single_image_embeds.shape[0] == 2:
                     single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
                     negative_image_embeds.append(single_negative_image_embeds)
                 image_embeds.append(single_image_embeds)
@@ -566,7 +669,7 @@ class StableDiffusionXLControlNetInpaintPipeline(
         ip_adapter_image_embeds = []
         for i, single_image_embeds in enumerate(image_embeds):
             single_image_embeds = torch.cat([single_image_embeds] * num_images_per_prompt, dim=0)
-            if do_classifier_free_guidance:
+            if do_classifier_free_guidance and single_image_embeds.shape[0]==2:
                 single_negative_image_embeds = torch.cat([negative_image_embeds[i]] * num_images_per_prompt, dim=0)
                 single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds], dim=0)
 
@@ -1171,7 +1274,8 @@ class StableDiffusionXLControlNetInpaintPipeline(
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         ip_adapter_image: Optional[PipelineImageInput] = None,
-        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        # ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        ip_adapter_image_embeds: Optional[torch.Tensor] = None,
         pooled_prompt_embeds: Optional[torch.Tensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pil",
@@ -1192,6 +1296,8 @@ class StableDiffusionXLControlNetInpaintPipeline(
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+
+        ip_adapter_scale = None,
         **kwargs,
     ):
         r"""
@@ -1368,21 +1474,13 @@ class StableDiffusionXLControlNetInpaintPipeline(
 
         controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
 
-        # align format for control guidance
-        if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
-            control_guidance_start = len(control_guidance_end) * [control_guidance_start]
-        elif not isinstance(control_guidance_end, list) and isinstance(control_guidance_start, list):
-            control_guidance_end = len(control_guidance_start) * [control_guidance_end]
-        elif not isinstance(control_guidance_start, list) and not isinstance(control_guidance_end, list):
-            mult = len(controlnet.nets) if isinstance(controlnet, MultiControlNetModel) else 1
-            control_guidance_start, control_guidance_end = (
-                mult * [control_guidance_start],
-                mult * [control_guidance_end],
-            )
-
         # # 0.0 Default height and width to unet
         # height = height or self.unet.config.sample_size * self.vae_scale_factor
         # width = width or self.unet.config.sample_size * self.vae_scale_factor
+        
+        # 0. set ip_adapter_scale
+        if ip_adapter_scale is not None:
+            self.set_ip_adapter_scale(ip_adapter_scale)
 
         # 0.1 align format for control guidance
         if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
@@ -1398,27 +1496,27 @@ class StableDiffusionXLControlNetInpaintPipeline(
 
         # 1. Check inputs
         self.check_inputs(
-            prompt,
-            prompt_2,
-            control_image,
-            mask_image,
-            strength,
-            num_inference_steps,
-            callback_steps,
-            output_type,
-            negative_prompt,
-            negative_prompt_2,
-            prompt_embeds,
-            negative_prompt_embeds,
-            ip_adapter_image,
-            ip_adapter_image_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-            controlnet_conditioning_scale,
-            control_guidance_start,
-            control_guidance_end,
-            callback_on_step_end_tensor_inputs,
-            padding_mask_crop,
+            prompt=prompt,
+            prompt_2=prompt_2,
+            image=control_image,
+            mask_image=mask_image,
+            strength=strength,
+            num_inference_steps=num_inference_steps,
+            callback_steps=callback_steps,
+            output_type=output_type,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            ip_adapter_image=ip_adapter_image,
+            ip_adapter_image_embeds=ip_adapter_image_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            controlnet_conditioning_scale=controlnet_conditioning_scale,
+            control_guidance_start=control_guidance_start,
+            control_guidance_end=control_guidance_end,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            padding_mask_crop=padding_mask_crop,
         )
 
         self._guidance_scale = guidance_scale
@@ -1438,11 +1536,17 @@ class StableDiffusionXLControlNetInpaintPipeline(
         if isinstance(controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
             controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet.nets)
 
+        global_pool_conditions = (
+            controlnet.config.global_pool_conditions
+            if isinstance(controlnet, ControlNetModel)
+            else controlnet.nets[0].config.global_pool_conditions
+        )
+        guess_mode = guess_mode or global_pool_conditions
+
         # 3. Encode input prompt
         text_encoder_lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
-
         (
             prompt_embeds,
             negative_prompt_embeds,
@@ -1464,7 +1568,7 @@ class StableDiffusionXLControlNetInpaintPipeline(
             clip_skip=self.clip_skip,
         )
 
-        # 3.1 Encode ip_adapter_image
+        # 3.1 Encode ip_adapter_image #############################################################
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
                 ip_adapter_image,
@@ -1472,8 +1576,10 @@ class StableDiffusionXLControlNetInpaintPipeline(
                 device,
                 batch_size * num_images_per_prompt,
                 self.do_classifier_free_guidance,
+                self.unet.dtype,
             )
-
+        ############################################################################################
+        
         # 4. set timesteps
         def denoising_value_valid(dnv):
             return isinstance(dnv, float) and 0 < dnv < 1

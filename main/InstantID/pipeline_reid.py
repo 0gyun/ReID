@@ -1159,7 +1159,7 @@ class StableDiffusionXLInstantIDPipeline(
 
         # 2. Define call parameters (prompt 형식에 따라 배치 크기 설정)
         if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
+            batch_size = 1 # 빈 prompt 줘서 채택
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
         else:
@@ -1175,18 +1175,18 @@ class StableDiffusionXLInstantIDPipeline(
             controlnet.config.global_pool_conditions
             if isinstance(controlnet, ControlNetModel)
             else controlnet.nets[0].config.global_pool_conditions
-        )
-        guess_mode = guess_mode or global_pool_conditions
+        ) # False
+        guess_mode = guess_mode or global_pool_conditions # False
 
         # 3.1 Encode input prompt
-        text_encoder_lora_scale = (
+        text_encoder_lora_scale = ( # None
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
         (
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
+            prompt_embeds, # [1,77,2048]
+            negative_prompt_embeds, # None
+            pooled_prompt_embeds, # [1, 1280]
+            negative_pooled_prompt_embeds, # None
         ) = self.encode_prompt(
             prompt,
             prompt_2,
@@ -1224,7 +1224,7 @@ class StableDiffusionXLInstantIDPipeline(
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
                 guess_mode=guess_mode,
             )
-            height, width = ctrl_image.shape[-2:]
+            height, width = ctrl_image.shape[-2:] # (1024, 1024)
         elif isinstance(controlnet, MultiControlNetModel):
             ctrl_images = []
 
@@ -1275,21 +1275,21 @@ class StableDiffusionXLInstantIDPipeline(
         # at which timestep to set the initial noise (n.b. 50% if strength is 0.5) (Inpainting)
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
         # create a boolean to check if the strength is set to 1. if so then initialise the latents with pure noise
-        is_strength_max = strength == 1.0
+        is_strength_max = strength == 1.0 # False
 
         # 5. Preprocess mask and image
         if padding_mask_crop is not None:
             crops_coords = self.mask_processor.get_crop_region(mask_image, width, height, pad=padding_mask_crop)
             resize_mode = "fill"
         else:
-            crops_coords = None
+            crops_coords = None # None
             resize_mode = "default"
             
         original_image = init_image # original image = 원본 이미지.
-        init_image = self.image_processor.preprocess(init_image, height=height, width=width)
+        init_image = self.image_processor.preprocess(init_image, height=height, width=width) # [1, 3, 1024, 1024]
         init_image = init_image.to(dtype=torch.float32)
 
-        mask = self.mask_processor.preprocess(mask_image, height=height, width=width)
+        mask = self.mask_processor.preprocess(mask_image, height=height, width=width) # [1, 1, 1024,1024]
 
         if masked_image_latents is not None:
             masked_image = masked_image_latents
@@ -1297,7 +1297,7 @@ class StableDiffusionXLInstantIDPipeline(
             # if images are in latent space, we can't mask it
             masked_image = None
         else:
-            masked_image = init_image * (mask < 0.5) # masked_image_latents를 안주기 때문에 이거로 간다.
+            masked_image = init_image * (mask < 0.5) # [1, 3, 1024, 1024] masked_image_latents를 안주기 때문에 이거로 간다.
 
         # 6. Prepare latent variables (unet에 입력으로 들어가서 이미지 생성의 기반이 될 latent 생성하는 부분.)
         num_channels_latents = self.vae.config.latent_channels # =4 Inpainting.
@@ -1323,13 +1323,14 @@ class StableDiffusionXLInstantIDPipeline(
         add_noise = True if self.denoising_start is None else False # 따로 안주니까 True
         latents_outputs = self.prepare_inpainting_latents( # 이미지 ([1, 3, 1024, 1024]) => latents ([1, 4, 128, 128])
             batch_size * num_images_per_prompt,
-            num_channels_latents,
+            # num_channels_latents,
+            num_channels_inpainting_unet,
             height,
             width,
             prompt_embeds.dtype,
             device,
             generator,
-            latents=init_latents,#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+            latents=latents,
             image=init_image,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
@@ -1344,6 +1345,7 @@ class StableDiffusionXLInstantIDPipeline(
         else:
             inpainting_latents, noise = latents_outputs
         
+        pdb.set_trace()
 
         # 7. Prepare mask latent variables
         # mask ([1, 1, 1024, 1024]) -> ([1, 1, 128, 128]) / masked_image_latents ([1, 4, 128, 128])
@@ -1386,12 +1388,12 @@ class StableDiffusionXLInstantIDPipeline(
             ).to(device=device, dtype=latents.dtype)
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta) # {'eta':0.0, 'generator': None}
 
         # 9. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        height, width = inpainting_latents.shape[-2:]
-        height = height * self.vae_scale_factor
-        width = width * self.vae_scale_factor
+        height, width = inpainting_latents.shape[-2:] # 128, 128
+        height = height * self.vae_scale_factor # 1024
+        width = width * self.vae_scale_factor # 1024
 
         original_size = original_size or (height, width)
         target_size = target_size or (height, width)
@@ -1410,7 +1412,7 @@ class StableDiffusionXLInstantIDPipeline(
             original_size = original_size or ctrl_image[0].shape[-2:]
         else:
             original_size = original_size or ctrl_image.shape[-2:]
-        target_size = target_size or (height, width)
+        target_size = target_size or (height, width) # 사이즈는 그대로 1024, 1024
 
         # 10. Prepare added time ids & embeddings
         if negative_original_size is None:
@@ -1419,11 +1421,11 @@ class StableDiffusionXLInstantIDPipeline(
             negative_target_size = target_size
 
         # text embedding에서 pooling된 정보를 사용한다.
-        add_text_embeds = pooled_prompt_embeds
+        add_text_embeds = pooled_prompt_embeds # encode_prompt할 때 나온 결과물로, [1,1280]
         if self.text_encoder_2 is None:
             text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
         else:
-            text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
+            text_encoder_projection_dim = self.text_encoder_2.config.projection_dim # 1280
         
         add_time_ids, add_neg_time_ids = self._get_add_time_ids2(
             original_size,
@@ -1480,10 +1482,10 @@ class StableDiffusionXLInstantIDPipeline(
             )
 
         # 8. Denoising loop
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        is_unet_compiled = is_compiled_module(self.unet)
-        is_controlnet_compiled = is_compiled_module(self.controlnet)
-        is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order # 0
+        is_unet_compiled = is_compiled_module(self.unet) # False
+        is_controlnet_compiled = is_compiled_module(self.controlnet) # False
+        is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1") # False
 
         if (
             self.denoising_end is not None
@@ -1516,7 +1518,7 @@ class StableDiffusionXLInstantIDPipeline(
                     torch._inductor.cudagraph_mark_step_begin()
                 # expand the latents if we are doing classifier free guidance (latent 확장 및 조정)
                 # for InstantID IdentityNet
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents # latents [1, 4, 128, 128]
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # expand the latents if we are doing classifier free guidance
@@ -1544,18 +1546,18 @@ class StableDiffusionXLInstantIDPipeline(
                         "time_ids": add_time_ids.chunk(2)[1],
                     }
                 else:
-                    control_model_input = latent_model_input
-                    controlnet_prompt_embeds = prompt_embeds
+                    control_model_input = latent_model_input # [1, 4, 128, 128]
+                    controlnet_prompt_embeds = prompt_embeds # [1, 77, 2048]
                     controlnet_added_cond_kwargs = added_cond_kwargs
                 
                 # cond_scale 계산 부분
                 if isinstance(controlnet_keep[i], list):
                     cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
                 else:
-                    controlnet_cond_scale = controlnet_conditioning_scale
+                    controlnet_cond_scale = controlnet_conditioning_scale # 1.0 default 값.
                     if isinstance(controlnet_cond_scale, list):
                         controlnet_cond_scale = controlnet_cond_scale[0]
-                    cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                    cond_scale = controlnet_cond_scale * controlnet_keep[i] # 1.0
 
                 # ControlNet inference 수행해서 down_block_res_samples와 mid_block_res_sample을 획득
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
@@ -1575,11 +1577,6 @@ class StableDiffusionXLInstantIDPipeline(
                     # add 0 to the unconditional batch to keep it unchanged.
                     down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
                     mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
-
-                # predict the noise residual
-                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-                    added_cond_kwargs["image_embeds"] = image_embeds
 
                 # predict the noise residual (latent에 대한 noise 예측. down_block_res_samples와 mid_block_res_sample 포함해서 예측)
                 noise_pred = self.unet(
@@ -1628,12 +1625,12 @@ class StableDiffusionXLInstantIDPipeline(
                     if torch.backends.mps.is_abailable():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         inpainting_latents = inpainting_latents.to(latents_dtype)
-                # latents_dtype = latents.dtype
-                # latents = self.scheduler.step(noise_pred_id, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                # if latents.dtype != latents_dtype:
-                #     if torch.backends.mps.is_abailable():
-                #         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                #         latents = latents.to(latents_dtype)
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_abailable():
+                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        latents = latents.to(latents_dtype)
                 # latents = (1-mask) * inpainting_latents + mask * latents
                 # inpainting_latents = latents
 
